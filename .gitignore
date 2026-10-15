@@ -3,6 +3,7 @@ node_modules/
 
 # Local runtime state
 .listening-state.json
+.volume.json
 *.log
 logs/
 

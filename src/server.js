@@ -2,6 +2,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { fileURLToPath } from "node:url";
@@ -14,6 +15,8 @@ const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const statePath = path.join(rootDir, ".listening-state.json");
+const volumeStatePath = path.join(rootDir, ".volume.json");   // 音量记忆持久化（独立于播放状态，stop 不清理）
+let persistedVolume = null;
 let webPlayerServer = null;
 let webPlayerPort = null;
 let playbackOperation = Promise.resolve();
@@ -24,17 +27,57 @@ let activeWebClientToken = null;
 let activeWebClientSeenAt = 0;
 let serverQueue = [];          // [{id,name,artist,album,coverUrl,durationMs}]
 let serverQueueIndex = -1;     // 当前曲目在 serverQueue 中的位置
-let serverPlayMode = "sequence"; // "sequence" | "shuffle"
+let serverOffQueue = false;    // 当前在播队列外临时曲目（手动切歌不污染原列表）
+let serverPlayMode = "sequence"; // "sequence" | "shuffle" | "single"
+let serverShuffleOrder = [];
+let serverStateVersion = 0;
+let controlOperation = Promise.resolve();
 let lastAutoAdvanceAt = 0;      // ??????????? 8765 ??????????
 const AUTO_ADVANCE_DEDUP_MS = 2500;
+
+function bumpServerState() {
+  serverStateVersion += 1;
+  return serverStateVersion;
+}
+
+function serializeControl(task) {
+  const next = controlOperation.then(task, task);
+  controlOperation = next.catch(() => {});
+  return next;
+}
+
+function resetShuffleOrder(anchor = serverQueueIndex) {
+  const indices = serverQueue.map((_, index) => index);
+  for (let i = indices.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  if (anchor >= 0 && anchor < indices.length) {
+    const position = indices.indexOf(anchor);
+    if (position > 0) {
+      indices.splice(position, 1);
+      indices.unshift(anchor);
+    }
+  }
+  serverShuffleOrder = indices;
+}
+
+// P3-1: preload next playable track stream URL near end, saves stream-fetch time on switch
+let preloadedUrl = null;
+let preloadedForId = "";
+let preloadedForIndex = -1;
+let preloadedForQuality = "";
+let preloadInFlight = false;
 
 // --- 播放/元数据/可播性缓存（降低切歌与轮询延迟） ---
 let playerStatusCache = null;          // { at, data } 短缓存 player status
 const PLAYER_STATUS_CACHE_MS = 900;    // 900ms 内复用，避免每次轮询都跑 neteasecli
+const PLAYLIST_TRACK_LIMIT = 1000;   // 歌单详情曲目上限（原写死 80，长歌单会被截断）
 const metaCache = new Map();           // key -> { t, value } 歌曲元数据/歌词/wiki
 const META_CACHE_MS = 10 * 60 * 1000;  // 10 分钟
 const probeCache = new Map();          // key -> { t, ok } 可播性探测缓存（仅缓存 ok 结果）
-const PROBE_OK_CACHE_MS = 30 * 1000;   // 只缓存"可播"结果 30s；VIP/失败结果不缓存，保证开通 VIP 后立即可播 // ????????????
+const PROBE_OK_CACHE_MS = 30 * 1000;   // 只缓存"可播"结果 30s，保证开通 VIP 后尽快恢复
+const PROBE_NEG_CACHE_MS = 60 * 1000;  // 不可播/VIP 结果缓存 60s：歌单播完时的整队列探测不再反复打网易云
 
 const appData = process.env.APPDATA ?? "";
 const neteaseCliScript = path.join(appData, "npm", "node_modules", "neteasecli", "dist", "index.js");
@@ -174,9 +217,63 @@ async function clearState() {
   }
 }
 
+// 音量记忆：独立于 .listening-state.json 持久化，mpv 重新 spawn 后恢复，避免回到最大声
+async function readPersistedVolume() {
+  try {
+    const parsed = JSON.parse(await fs.readFile(volumeStatePath, "utf8"));
+    const v = Number(parsed?.volume);
+    return Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : null;
+  } catch {
+    return null;
+  }
+}
+async function savePersistedVolume(volume) {
+  const v = Math.max(0, Math.min(100, Math.round(Number(volume) || 0)));
+  await fs.writeFile(volumeStatePath, JSON.stringify({ volume: v }, null, 2), "utf8");
+  return v;
+}
+// 播放/重播后把记忆音量重新应用到当前 mpv 实例（复用或新 spawn 都覆盖）
+async function ensurePlayerVolume(playerModule) {
+  if (persistedVolume === null) {
+    persistedVolume = await readPersistedVolume();
+  }
+  if (persistedVolume !== null) {
+    await playerModule.mpvPlayer.setVolume(persistedVolume);
+  }
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+async function cleanupStaleMpvAtStartup() {
+  // 启动时清理跨会话残留的莲心 mpv：旧会话 detached 启动的 mpv 不会随退出结束，
+  // 会持续独占单实例命名管道 \\.\pipe\neteasecli-mpv，导致新实例 IPC 绑定失败
+  // 却仍在出声（"mpv started but IPC socket not available" + 多通道同播）。
+  // 按可执行路径（netease-music-mcp-main）或命令行特征（neteasecli-mpv）精确匹配，
+  // 避免误杀用户自己打开的其它 mpv。
+  if (process.platform !== "win32") {
+    try {
+      await execFileAsync("pkill", ["-f", "neteasecli-mpv"], { timeout: 5000 });
+    } catch {
+      // 无残留则忽略
+    }
+    return;
+  }
+  const ps = [
+    "$t = Get-CimInstance Win32_Process -Filter \"Name='mpv.exe' or Name='mpv.com'\" | Where-Object { ($_.ExecutablePath -like '*netease-music-mcp-main*') -or ($_.CommandLine -like '*neteasecli-mpv*') }",
+    "$t | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+  ].join("; ");
+  try {
+    await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+      timeout: 8000,
+      windowsHide: true,
+    });
+    console.error("[netease-mcp] 启动清理：已清理残留 mpv 进程");
+  } catch (error) {
+    console.error("[netease-mcp] 启动清理 mpv 失败: " + String(error.message ?? error));
+  }
+}
+
 
 async function stopMpvProcesses() {
   if (process.platform !== "win32") {
@@ -298,6 +395,27 @@ async function withPlaybackLock(action) {
   }
 }
 
+// 端口级判活：只看 127.0.0.1:port 上是否已有监听者，不依赖对端是否及时应答。
+// 启动期用它决定"复用已有播放器"还是"自己起一个"，避免两个主人互杀。
+async function isPortListening(port, timeoutMs = 500) {
+  return await new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch { /* already closed */ }
+      resolve(value);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
+// 保留给显式清理场景（未来若确实需要真正关闭播放器可手动调用）。
+// 自 2026-10 起启动流程与 shutdown 工具都不再自动调用它，避免把 8765 弄下线。
 async function closeWebPlayerBestEffort() {
   const fallbackPort = webPlayerPort || 8765;
   if (!webPlayerServer) {
@@ -748,8 +866,8 @@ async function getDashboardData() {
 }
 
 async function getPlaylistViewData(id) {
-  const detail = await getPlaylistDetail(id, 80);
-  const tracks = await enrichTracks(detail.tracks ?? [], 80);
+  const detail = await getPlaylistDetail(id, PLAYLIST_TRACK_LIMIT);
+  const tracks = await enrichTracks(detail.tracks ?? [], 100);
   return {
     success: true,
     playlist: {
@@ -1026,6 +1144,7 @@ async function restartCachedTrack(reason = "restart") {
   const restarted = await playTrackById(state.id, {
     quality: state.quality ?? "exhigh",
     style: state.style,
+    trigger: "replay",
   });
   return {
     success: true,
@@ -1046,9 +1165,14 @@ async function probeTrackPlayable(id, quality = "exhigh") {
   // 注意：这是实时探测，不写死 VIP 名单；若账号后续开通 VIP，track url 会返回可用链接，
   // 本函数自然返回 ok，不会跳过该曲目。
   const cacheKey = `${id}@${quality}`;
-  const hit = probeCache.get(cacheKey);
-  if (hit && hit.ok && Date.now() - hit.t < PROBE_OK_CACHE_MS) {
-    return { ok: true, reason: "ok", message: "" };
+  const cached = probeCache.get(cacheKey);
+  if (cached) {
+    const ttl = cached.ok ? PROBE_OK_CACHE_MS : PROBE_NEG_CACHE_MS;
+    if (Date.now() - cached.t < ttl) {
+      return cached.ok
+        ? { ok: true, reason: "ok", message: "" }
+        : { ok: false, reason: cached.reason || "other", message: cached.message || "" };
+    }
   }
   try {
     const module = await neteaseModule(neteaseCliTrackModule);
@@ -1057,13 +1181,13 @@ async function probeTrackPlayable(id, quality = "exhigh") {
       probeCache.set(cacheKey, { t: Date.now(), ok: true });
       return { ok: true, reason: "ok", message: "" };
     }
+    probeCache.set(cacheKey, { t: Date.now(), ok: false, reason: "other", message: "empty url" });
     return { ok: false, reason: "other", message: "empty url" };
   } catch (error) {
     const message = String(error?.message ?? error ?? "");
-    if (/copyright|vip|unavailable|\u7248\u6743|\u4f1a\u5458/i.test(message)) {
-      return { ok: false, reason: "vip", message };
-    }
-    return { ok: false, reason: "other", message };
+    const reason = /copyright|vip|unavailable|\u7248\u6743|\u4f1a\u5458/i.test(message) ? "vip" : "other";
+    probeCache.set(cacheKey, { t: Date.now(), ok: false, reason, message });
+    return { ok: false, reason, message };
   }
 }
 
@@ -1081,10 +1205,13 @@ async function findPlayableNextInQueue(index, direction, quality) {
   if (total <= 1) return null;
   const candidates = [];
   if (serverPlayMode === "shuffle") {
-    for (let i = 0; i < total; i++) if (i !== index) candidates.push(i);
-    for (let i = candidates.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    if (serverShuffleOrder.length !== total || !serverShuffleOrder.includes(index)) {
+      resetShuffleOrder(index);
+    }
+    const position = serverShuffleOrder.indexOf(index);
+    const step = direction === "prev" ? -1 : 1;
+    for (let offset = 1; offset < total; offset++) {
+      candidates.push(serverShuffleOrder[(position + step * offset + total) % total]);
     }
   } else {
     const step = direction === "prev" ? -1 : 1;
@@ -1159,21 +1286,30 @@ function recordPlaybackInQueue(state, { wholeQueue = null } = {}) {
     serverQueue = wholeQueue.map(queueEntryFromState).filter((t) => t.id);
     serverQueueIndex = serverQueue.findIndex((t) => t.id === entry.id);
     if (serverQueueIndex < 0) serverQueueIndex = 0;
+    serverOffQueue = false;
     return;
   }
   if (!serverQueue.length) {
     serverQueue = [entry];
     serverQueueIndex = 0;
+    serverOffQueue = false;
     return;
   }
   const found = serverQueue.findIndex((t) => t.id === entry.id);
-  serverQueueIndex = found >= 0 ? found : serverQueue.length;
-  if (found < 0) serverQueue.push(entry);
+  if (found >= 0) {
+    serverQueueIndex = found;
+    serverOffQueue = false;
+    return;
+  }
+  // 手动播放队列外曲目：作为"临时播放"处理，不把该曲 push 进队列、不打乱原列表顺序。
+  // 保留 serverQueueIndex 作为回归队列的锚点，该曲播完自动回到原列表继续按序播放。
+  serverOffQueue = true;
 }
 
 function buildQueueResponse(state) {
   return {
     success: true,
+    stateVersion: serverStateVersion,
     playback: playbackInfo(state),
     lyrics: state.lyrics ?? [],
     position: 0,
@@ -1182,11 +1318,31 @@ function buildQueueResponse(state) {
     paused: false,
     queueIndex: serverQueueIndex,
     queue: serverQueue,
+    playOrder: serverPlayMode === "shuffle" ? serverShuffleOrder : [],
     mode: serverPlayMode,
   };
 }
 
-async function serverNextTrack() {
+async function playFirstPlayableInQueue(trigger = "manual") {
+  if (!serverQueue.length) return null;
+  const quality = "exhigh";
+  const total = serverQueue.length;
+  if (total === 1) {
+    const played = await playTrackById(serverQueue[0].id, { quality, alreadyChecked: true, trigger });
+    serverQueueIndex = 0;
+    serverOffQueue = false;
+    return played;
+  }
+  const candidate = await findPlayableNextInQueue(-1, "next", quality);
+  if (!candidate) return null;
+  const preloaded = usePreloadedTrack(candidate.track.id, quality);
+  const played = await playTrackById(candidate.track.id, { quality, alreadyChecked: true, trigger, preloadedUrl: preloaded?.url ?? null });
+  serverQueueIndex = candidate.index;
+  serverOffQueue = false;
+  return played;
+}
+
+async function serverNextTrack(trigger = "manual") {
   const state = await readState();
   const currentId = state?.id ? String(state.id) : "";
   if (!serverQueue.length || !currentId) {
@@ -1194,10 +1350,15 @@ async function serverNextTrack() {
       const replay = await replayCurrentTrackFromStart(currentId);
       return buildQueueResponse(replay);
     }
+    const started = await playFirstPlayableInQueue(trigger);
+    if (started) return buildQueueResponse(started);
     throw new Error("当前没有可播放的曲目");
   }
   let index = serverQueueIndex;
-  if (index < 0 || !serverQueue[index] || String(serverQueue[index].id) !== currentId) {
+  if (serverOffQueue) {
+    // 当前在播队列外临时曲目：从原队列锚点继续播下一首，回归原列表
+    serverOffQueue = false;
+  } else if (index < 0 || !serverQueue[index] || String(serverQueue[index].id) !== currentId) {
     index = serverQueue.findIndex((t) => String(t.id) === currentId);
   }
   if (index < 0) index = 0;
@@ -1208,12 +1369,13 @@ async function serverNextTrack() {
     const replay = await replayCurrentTrackFromStart(currentId);
     return buildQueueResponse(replay);
   }
-  const played = await playTrackById(candidate.track.id, { quality, alreadyChecked: true });
+  const preloaded = usePreloadedTrack(candidate.track.id, quality);
+  const played = await playTrackById(candidate.track.id, { quality, alreadyChecked: true, trigger, preloadedUrl: preloaded?.url ?? null });
   serverQueueIndex = candidate.index;
   return buildQueueResponse(played);
 }
 
-async function serverPrevTrack() {
+async function serverPrevTrack(trigger = "manual") {
   const state = await readState();
   const currentId = state?.id ? String(state.id) : "";
   if (!serverQueue.length || !currentId) {
@@ -1221,10 +1383,14 @@ async function serverPrevTrack() {
       const replay = await replayCurrentTrackFromStart(currentId);
       return buildQueueResponse(replay);
     }
+    const started = await playFirstPlayableInQueue(trigger);
+    if (started) return buildQueueResponse(started);
     throw new Error("当前没有可播放的曲目");
   }
   let index = serverQueueIndex;
-  if (index < 0 || !serverQueue[index] || String(serverQueue[index].id) !== currentId) {
+  if (serverOffQueue) {
+    serverOffQueue = false;
+  } else if (index < 0 || !serverQueue[index] || String(serverQueue[index].id) !== currentId) {
     index = serverQueue.findIndex((t) => String(t.id) === currentId);
   }
   if (index < 0) index = 0;
@@ -1242,12 +1408,13 @@ async function serverPrevTrack() {
     const replay = await replayCurrentTrackFromStart(currentId);
     return buildQueueResponse(replay);
   }
-  const played = await playTrackById(candidate.track.id, { quality, alreadyChecked: true });
+  const preloaded = usePreloadedTrack(candidate.track.id, quality);
+  const played = await playTrackById(candidate.track.id, { quality, alreadyChecked: true, trigger, preloadedUrl: preloaded?.url ?? null });
   serverQueueIndex = candidate.index;
   return buildQueueResponse(played);
 }
 
-async function playTrackById(id, { quality = "exhigh", style = "", wholeQueue = null, alreadyChecked = false } = {}) {
+async function playTrackById(id, { quality = "exhigh", style = "", wholeQueue = null, alreadyChecked = false, preloadedUrl = null, trigger = "playlist" } = {}) {
   const _pt0 = Date.now();
   return withPlaybackLock(async () => {
     if (!alreadyChecked) {
@@ -1282,6 +1449,7 @@ async function playTrackById(id, { quality = "exhigh", style = "", wholeQueue = 
         lyrics: lyricData.lines,
         wiki: wikiMetadata,
         quality,
+        trigger,
         startedAt: new Date().toISOString(),
       };
     })();
@@ -1295,10 +1463,15 @@ async function playTrackById(id, { quality = "exhigh", style = "", wholeQueue = 
         neteaseModule(neteaseCliPlayerModule),
         neteaseModule(neteaseCliTrackModule),
       ]);
-      const url = await trackModule.getTrackUrl(String(id), quality);
+      if (preloadedForId && preloadedForId !== String(id)) {
+        clearPreloadedTrack();
+      }
+      const url = preloadedUrl || (await trackModule.getTrackUrl(String(id), quality));
       await playerModule.mpvPlayer.load(url, `${state.name} - ${state.artist}`);
+      await ensurePlayerVolume(playerModule);   // 音量记忆：新曲播放后恢复记忆音量，避免回到最大声
       await writeState({ ...state, active: true });
       recordPlaybackInQueue(state, { wholeQueue });
+      bumpServerState();
       console.error(`[netease-mcp] playTrackById ${id} ok in ${Date.now() - _pt0}ms`);
       return state;
     } catch (error) {
@@ -1327,7 +1500,7 @@ async function replayCurrentTrackFromStart(id) {
     if (!state?.id || String(state.id) !== requestedId) {
       throw new Error("Cached track does not match the requested replay target");
     }
-    const replayState = { ...state, startedAt: new Date().toISOString() };
+    const replayState = { ...state, startedAt: new Date().toISOString(), trigger: "replay" };
     replayRequestGuard = { id: requestedId, expiresAt: Date.now() + 8000 };
     pendingPlaybackState = { ...replayState, pendingMode: "replay_wait", pendingSince: Date.now() };
     pendingPlaybackExpiresAt = Date.now() + 15000;
@@ -1341,6 +1514,7 @@ async function replayCurrentTrackFromStart(id) {
       } catch {
         const url = await trackModule.getTrackUrl(requestedId, replayState.quality ?? "exhigh");
         await playerModule.mpvPlayer.load(url, `${replayState.name} - ${replayState.artist}`);
+        await ensurePlayerVolume(playerModule);   // 音量记忆：重播 fallback load 后恢复记忆音量
       }
       await delay(150);
       const status = await getPlayerStatus().catch(() => null);
@@ -1363,6 +1537,10 @@ async function toggleOrRestartPlayback() {
     const statusData = status?.data;
     const state = await readState();
     if (!statusData?.playing && !statusData?.paused) {
+      if (!state?.id) {
+        const started = await playFirstPlayableInQueue("manual");
+        if (started) return { success: true, mode: "queue_start", ...buildQueueResponse(started) };
+      }
       return restartCachedTrack("no_active_player");
     }
     if (statusLooksEnded(statusData, state?.durationMs)) {
@@ -2952,6 +3130,9 @@ function playerHtml() {
         <button class="icon-btn list-icon mode-control" id="shuffleMode" title="随机播放" aria-label="随机播放">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15l6 6"/><path d="M4 4l5 5"/></svg>
         </button>
+        <button class="icon-btn list-icon mode-control" id="singleMode" title="单曲循环" aria-label="单曲循环">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/></svg>
+        </button>
       </div>
       <div class="progress-wrap">
         <button class="queue-toggle-mini" id="queueToggle" title="播放列表" aria-label="播放列表">
@@ -3173,9 +3354,10 @@ function playerHtml() {
     function updatePlayModeUi() {
       $("sequenceMode").classList.toggle("active", playMode === "sequence");
       $("shuffleMode").classList.toggle("active", playMode === "shuffle");
+      $("singleMode").classList.toggle("active", playMode === "single");
     }
     function setPlayMode(mode) {
-      playMode = mode === "shuffle" ? "shuffle" : "sequence";
+      playMode = mode === "single" ? "single" : mode === "shuffle" ? "shuffle" : "sequence";
       updatePlayModeUi();
       void api("/api/play-mode", { mode: playMode }).catch(() => {});
     }
@@ -4090,6 +4272,7 @@ function playerHtml() {
     $("nextTrack").onclick = () => { void playNextFromQueue().catch((error) => { $("status").textContent = error.message || "下一首失败"; }); };
     $("sequenceMode").onclick = () => setPlayMode("sequence");
     $("shuffleMode").onclick = () => setPlayMode("shuffle");
+    $("singleMode").onclick = () => setPlayMode("single");
     $("queueToggle").onclick = () => {
       renderQueue();
       $("queuePanel").classList.toggle("hidden");
@@ -4191,6 +4374,8 @@ function acceptWebClient(req) {
 }
 
 function validateWebPlaybackClient(req) {
+  // 莲心桌面端桥接（api_server）永远放行，不受浏览器 token 影响
+  if (String(req.headers["x-lianxin-bridge"] ?? "").trim() === "1") return true;
   const token = String(req.headers["x-web-player-client"] ?? "").trim();
   const activeFresh = activeWebClientToken && Date.now() - activeWebClientSeenAt < 12 * 60 * 60 * 1000;
   return !activeFresh || token === activeWebClientToken;
@@ -4208,9 +4393,21 @@ async function handleWebApi(req, res) {
       jsonResponse(res, 200, await currentListeningContext());
       return;
     }
+    if (req.method === "GET" && url.pathname === "/api/ping") {
+      // 轻量探针：只证明 Web 播放器进程活着且事件循环通畅，不触碰 mpv IPC
+      // （/api/status 在 mpv 半死时最坏要 ~3s，会让外部判活误报"离线"）。
+      jsonResponse(res, 200, {
+        success: true,
+        ok: true,
+        uptime: Number(process.uptime().toFixed(3)),
+        webPlayerPort,
+        stateVersion: serverStateVersion,
+      });
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/api/status") {
       const [status, state] = await Promise.all([getPlayerStatus(), readState()]);
-      jsonResponse(res, 200, { success: true, status: status.data, playback: state ? playbackInfo(state) : null, listening: state });
+      jsonResponse(res, 200, { success: true, stateVersion: serverStateVersion, status: status.data, playback: state ? playbackInfo(state) : null, listening: state });
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/dashboard") {
@@ -4271,7 +4468,7 @@ async function handleWebApi(req, res) {
         jsonResponse(res, 404, { success: false, message: `No search results for ${keyword}` });
         return;
       }
-      const state = await playTrackById(tracks[0].id, { quality: body.quality ?? "exhigh", style: body.style ?? "", wholeQueue: tracks.slice(0, 10) });
+      const state = await playTrackById(tracks[0].id, { quality: body.quality ?? "exhigh", style: body.style ?? "", wholeQueue: tracks.slice(0, 10), trigger: "manual" });
       jsonResponse(res, 200, {
         success: true,
         selected: tracks[0],
@@ -4302,11 +4499,12 @@ async function handleWebApi(req, res) {
         try {
           state = await replayCurrentTrackFromStart(id);
         } catch {
-          state = await playTrackById(id, { quality: body.quality ?? "exhigh" });
+          state = await playTrackById(id, { quality: body.quality ?? "exhigh", trigger: "manual" });
         }
       } else {
-        state = await playTrackById(id, { quality: body.quality ?? "exhigh" });
+        state = await playTrackById(id, { quality: body.quality ?? "exhigh", trigger: "manual" });
       }
+      playerStatusCache = null;
       jsonResponse(res, 200, {
         success: true,
         playback: playbackInfo(state),
@@ -4331,6 +4529,7 @@ async function handleWebApi(req, res) {
         return;
       }
       const state = await replayCurrentTrackFromStart(id);
+      playerStatusCache = null;
       jsonResponse(res, 200, {
         success: true,
         playback: playbackInfo(state),
@@ -4345,7 +4544,7 @@ async function handleWebApi(req, res) {
     }
 
     if (req.method === "GET" && url.pathname === "/api/queue") {
-      jsonResponse(res, 200, { success: true, queue: serverQueue, index: serverQueueIndex, mode: serverPlayMode });
+      jsonResponse(res, 200, { success: true, stateVersion: serverStateVersion, queue: serverQueue, index: serverQueueIndex, mode: serverPlayMode, playOrder: serverPlayMode === "shuffle" ? serverShuffleOrder : [] });
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/queue") {
@@ -4353,14 +4552,21 @@ async function handleWebApi(req, res) {
       if (Array.isArray(body.tracks)) {
         serverQueue = body.tracks.map(queueEntryFromState).filter((t) => t.id);
         serverQueueIndex = serverQueue.length ? Math.max(0, Math.min(serverQueue.length - 1, Number(body.index ?? 0) || 0)) : -1;
+        serverOffQueue = false;
+        serverShuffleOrder = [];
+        bumpServerState();
       }
-      jsonResponse(res, 200, { success: true, queue: serverQueue, index: serverQueueIndex, mode: serverPlayMode });
+      jsonResponse(res, 200, { success: true, stateVersion: serverStateVersion, queue: serverQueue, index: serverQueueIndex, mode: serverPlayMode, playOrder: serverPlayMode === "shuffle" ? serverShuffleOrder : [] });
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/play-mode") {
       const body = await readRequestJson(req);
-      serverPlayMode = body.mode === "shuffle" ? "shuffle" : "sequence";
-      jsonResponse(res, 200, { success: true, mode: serverPlayMode });
+      serverPlayMode = body.mode === "single" ? "single" : body.mode === "shuffle" ? "shuffle" : "sequence";
+      if (serverPlayMode === "shuffle") resetShuffleOrder(serverQueueIndex);
+      else serverShuffleOrder = [];
+      bumpServerState();
+      playerStatusCache = null;
+      jsonResponse(res, 200, { success: true, stateVersion: serverStateVersion, mode: serverPlayMode });
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/next") {
@@ -4370,7 +4576,8 @@ async function handleWebApi(req, res) {
         return;
       }
       if (body?.auto === true) lastAutoAdvanceAt = Date.now();
-      jsonResponse(res, 200, await serverNextTrack());
+      playerStatusCache = null;
+      jsonResponse(res, 200, await serializeControl(() => serverNextTrack(body?.auto === true ? "auto" : "manual")));
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/prev") {
@@ -4380,7 +4587,8 @@ async function handleWebApi(req, res) {
         return;
       }
       if (body?.auto === true) lastAutoAdvanceAt = Date.now();
-      jsonResponse(res, 200, await serverPrevTrack());
+      playerStatusCache = null;
+      jsonResponse(res, 200, await serializeControl(() => serverPrevTrack(body?.auto === true ? "auto" : "manual")));
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/play-playlist") {
@@ -4400,7 +4608,8 @@ async function handleWebApi(req, res) {
         jsonResponse(res, 404, { success: false, message: "Playlist has no playable tracks" });
         return;
       }
-      const state = await playTrackById(track.id, { quality: body.quality ?? "exhigh", wholeQueue: detail.tracks ?? [] });
+      const state = await playTrackById(track.id, { quality: body.quality ?? "exhigh", wholeQueue: detail.tracks ?? [], trigger: "manual" });
+      playerStatusCache = null;
       jsonResponse(res, 200, { success: true, playlist: normalizePlaylistCard(detail, detail), selected: track, playback: playbackInfo(state), queueIndex: serverQueueIndex, queue: serverQueue, ai_context: buildStartContext(state) });
       return;
     }
@@ -4410,6 +4619,7 @@ async function handleWebApi(req, res) {
         return;
       }
       const result = await toggleOrRestartPlayback();
+      playerStatusCache = null;
       jsonResponse(res, 200, { success: true, result });
       return;
     }
@@ -4426,6 +4636,7 @@ async function handleWebApi(req, res) {
       }
       const playerModule = await neteaseModule(neteaseCliPlayerModule);
       await playerModule.mpvPlayer.seek(seconds, "absolute");
+      playerStatusCache = null;
       jsonResponse(res, 200, { success: true, position: seconds, result: { success: true } });
       return;
     }
@@ -4442,6 +4653,8 @@ async function handleWebApi(req, res) {
       }
       const playerModule = await neteaseModule(neteaseCliPlayerModule);
       await playerModule.mpvPlayer.setVolume(volume);
+      persistedVolume = await savePersistedVolume(volume);   // 音量记忆：落盘，重启/切歌后恢复
+      playerStatusCache = null;
       jsonResponse(res, 200, { success: true, volume, result: { success: true } });
       return;
     }
@@ -4454,6 +4667,7 @@ async function handleWebApi(req, res) {
       clearReplayRequestGuard();
       const result = await stopActivePlaybackStrict();
       await clearState();
+      playerStatusCache = null;
       jsonResponse(res, 200, { success: true, result });
       return;
     }
@@ -4770,18 +4984,17 @@ server.registerTool("stop", {
 
 server.registerTool("shutdown", {
   title: "End listening session",
-  description: "Use this when the user asks to end the listening session, stop listening to music, close the player, or stop the music program. It stops mpv playback, clears listening state, and closes the current web player server, while keeping the MCP tool process alive for future calls.",
+  description: "Use this when the user asks to end the listening session or stop listening to music. It stops mpv playback and clears the listening state, but deliberately keeps the local web player serving on 8765 so the next play request works immediately.",
   inputSchema: {},
 }, async () => {
-  const [playback, webPlayer] = await Promise.all([
-    stopPlaybackBestEffort(),
-    closeWebPlayerBestEffort(),
-  ]);
+  // 只停播放 + 清听歌状态，刻意保留本地 Web 播放器（8765）：
+  // 关掉 8765 会让莲心桥接把它判成"离线"，之后所有音乐操作都会失败。
+  const playback = await stopPlaybackBestEffort();
   return textResult({
     success: true,
-    message: "Stopped playback and closed the current web player. The MCP server is still running for future calls.",
+    message: "Stopped playback and cleared the listening state. The local web player service stays available for future calls.",
     playback,
-    webPlayer,
+    webPlayer: { success: true, closed: false, kept: true },
   });
 });
 
@@ -4862,6 +5075,54 @@ async function selfTest() {
 // 命中则自动调用 serverNextTrack()。修复"mpv 播完即退出导致页面/桥接检测不到结尾"的问题。
 // 用 lastAutoAdvanceAt 与 /api/next auto 共用去重窗口，避免与手动切歌/页面 autoAdvance 重复。
 let serverAutoAdvanceRunning = false;
+const PRELOAD_NEAR_END_SECONDS = 3.5; // 距结尾还剩多少秒时开始预加载下一首
+function clearPreloadedTrack() {
+  preloadedUrl = null;
+  preloadedForId = "";
+  preloadedForIndex = -1;
+  preloadedForQuality = "";
+}
+// P3-1: consume matching preload, or invalidate stale one so it cannot block future prefetch
+function usePreloadedTrack(id, quality) {
+  const hit = preloadedUrl && preloadedForId === String(id) && preloadedForQuality === quality;
+  const url = hit ? preloadedUrl : null;
+  clearPreloadedTrack();
+  return hit ? { url } : null;
+}
+// P3-2: background-prefetch next playable track stream URL near end (non-blocking)
+async function maybePreloadNextTrack(state, sd) {
+  if (preloadInFlight || preloadedUrl) return;
+  if (serverPlayMode === "single") return;
+  if (serverQueue.length <= 1) return;
+  const position = Number(sd?.position ?? 0);
+  const duration = Number(sd?.duration ?? 0) || (Number(state?.durationMs ?? 0) / 1000);
+  if (!duration || !Number.isFinite(position)) return;
+  if (duration - position > PRELOAD_NEAR_END_SECONDS) return;
+  const quality = state?.quality ?? "exhigh";
+  let index = serverQueueIndex;
+  if (!serverOffQueue && (index < 0 || !serverQueue[index] || String(serverQueue[index].id) !== String(state.id))) {
+    index = serverQueue.findIndex((t) => String(t.id) === String(state.id));
+  }
+  if (index < 0) index = 0;
+  preloadInFlight = true;
+  try {
+    const candidate = await findPlayableNextInQueue(index, "next", quality);
+    if (!candidate) return;
+    const trackModule = await neteaseModule(neteaseCliTrackModule);
+    const url = await trackModule.getTrackUrl(String(candidate.track.id), quality);
+    if (url) {
+      preloadedUrl = url;
+      preloadedForId = String(candidate.track.id);
+      preloadedForIndex = candidate.index;
+      preloadedForQuality = quality;
+      console.error(`[netease-mcp] 已预加载下一首流：${candidate.track.name}（${candidate.track.id}）`);
+    }
+  } catch (error) {
+    console.error(`[netease-mcp] 预加载下一首失败: ${String(error?.message ?? error)}`);
+  } finally {
+    preloadInFlight = false;
+  }
+}
 async function maybeServerAutoAdvance() {
   if (serverAutoAdvanceRunning) return;
   serverAutoAdvanceRunning = true;
@@ -4873,12 +5134,21 @@ async function maybeServerAutoAdvance() {
     // 复用共享的 player status 缓存（900ms），避免自动 next 检查额外产生 neteasecli 子进程调用
     const status = await getPlayerStatus().catch(() => null);
     const sd = status?.data;
-    if (!sd || sd.paused) return;
+    // mpv reaches the end with `paused: true` for a short period. Only treat
+    // a paused track as user-paused when it has not reached its duration.
+    if (!sd || (sd.paused && !statusLooksEnded(sd, state.durationMs))) return;
+    // P3-2: 接近结尾（剩余 <=3s）且队列>1 时后台预取下一首可播曲目的流 URL
+    void maybePreloadNextTrack(state, sd);
     // 条件 A：mpv 仍存活但 position 已到结尾
     if (statusLooksEnded(sd, state.durationMs)) {
       lastAutoAdvanceAt = now;
-      console.error(`[netease-mcp] 服务端自动下一首（结尾）：${state.name}`);
-      await serverNextTrack();
+      if (serverPlayMode === "single") {
+        console.error(`[netease-mcp] 单曲循环重播：${state.name}`);
+        await replayCurrentTrackFromStart(state.id);
+      } else {
+        console.error(`[netease-mcp] 服务端自动下一首（结尾）：${state.name}`);
+        await serverNextTrack("auto");
+      }
       return;
     }
     // 条件 B：mpv 已退出/停止，且已播放时长超过曲目时长（覆盖 mpv 播完即退出的场景）
@@ -4888,8 +5158,13 @@ async function maybeServerAutoAdvance() {
     const mpvIdle = !sd.playing || (sd.playing === true && !sd.paused && sd.position === 0 && sd.duration === 0);
     if (durationMs > 1500 && elapsed > durationMs - 800 && mpvIdle) {
       lastAutoAdvanceAt = now;
-      console.error(`[netease-mcp] 服务端自动下一首（mpv已停止）：${state.name}`);
-      await serverNextTrack();
+      if (serverPlayMode === "single") {
+        console.error(`[netease-mcp] 单曲循环重播（mpv已停止）：${state.name}`);
+        await replayCurrentTrackFromStart(state.id);
+      } else {
+        console.error(`[netease-mcp] 服务端自动下一首（mpv已停止）：${state.name}`);
+        await serverNextTrack("auto");
+      }
       return;
     }
   } catch (error) {
@@ -4915,9 +5190,15 @@ async function main() {
   // 莲心以 stdio 拉起时也自动托管本地 Web 播放器（默认 8765），
   // 这样浏览器端始终能同步莲心播放的曲目与进度条。
   try {
-    await closeStandaloneWebPlayerBestEffort(8765);
-    const web = await startWebPlayer(8765);
-    console.error("netease-music-mcp web player: " + web.url);
+    await cleanupStaleMpvAtStartup();
+    // 先到先得：若莲心桥接已经起了播放器（8765 已在监听），直接复用，不杀它。
+    // 两边都不再抢端口，也就不会出现"新起的 node 立刻 EADDRINUSE 静默退出"。
+    if (await isPortListening(8765)) {
+      console.error("netease-music-mcp web player: 8765 已在监听，复用现有播放器");
+    } else {
+      const web = await startWebPlayer(8765);
+      console.error("netease-music-mcp web player: " + web.url);
+    }
   } catch (error) {
     console.error("netease-music-mcp web player 启动失败（不影响 MCP 主服务）: " + String(error.message ?? error));
   }
